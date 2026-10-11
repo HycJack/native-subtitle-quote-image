@@ -29,6 +29,10 @@ MAX_TIMES_PER_IMAGE = 7
 # 真实访谈相邻句子的整帧差异通常在 5% 以上；静态封面重编码后接近 0。
 DUPLICATE_PIXEL_RATIO = 0.005
 DIFF_LEVEL = 12
+# 抽帧临时文件目录环境变量；--tmp-dir 优先，都未设置时用系统临时目录。
+TMP_DIR_ENV = "NSQI_TMP_DIR"
+# 由 main() 根据 --tmp-dir / 环境变量设置；None 表示系统默认。
+TMP_DIR = None
 
 
 def ffmpeg(args, context="FFmpeg 处理失败"):
@@ -82,12 +86,38 @@ def validate_time(value, label="时间点"):
     return seconds
 
 
-def grab_frame(path, seconds):
+def resolve_tmp_dir(value=None):
+    """解析抽帧临时目录：参数优先，其次环境变量；都没有返回 None（系统默认）。"""
+    source = "--tmp-dir"
+    if value is None:
+        value = os.environ.get(TMP_DIR_ENV)
+        source = f"环境变量 {TMP_DIR_ENV}"
+    if value is None or not str(value).strip():
+        return None
+    path = Path(value).expanduser().resolve()
+    if not path.exists():
+        raise SystemExit(f"{source} 指定的临时目录不存在: {path}")
+    if not path.is_dir():
+        raise SystemExit(f"{source} 指定的路径不是目录: {path}")
+    if not os.access(path, os.W_OK | os.X_OK):
+        raise SystemExit(f"{source} 指定的临时目录不可写: {path}")
+    return str(path)
+
+
+def grab_frame(path, seconds, tmp_dir=None):
     """先快速跳转，再精确解码 3 秒，避免长 GOP 视频错帧。"""
     seconds = validate_time(seconds)
     preseek = max(0.0, seconds - 3.0)
     offset = seconds - preseek
-    fd, tmp = tempfile.mkstemp(suffix=".png")
+    tmp_dir = tmp_dir or TMP_DIR
+    try:
+        fd, tmp = tempfile.mkstemp(suffix=".png", dir=tmp_dir)
+    except OSError as exc:
+        where = tmp_dir or tempfile.gettempdir()
+        raise SystemExit(
+            f"无法在临时目录创建抽帧文件: {where}（{exc.strerror or exc}）；"
+            f"可用 --tmp-dir 或环境变量 {TMP_DIR_ENV} 指定可写目录"
+        ) from None
     os.close(fd)
     try:
         ffmpeg(
@@ -1057,6 +1087,9 @@ def command_render_script(args):
     )
 
 
+TMP_DIR_HELP = f"抽帧临时文件目录（默认系统临时目录，也可用环境变量 {TMP_DIR_ENV}）"
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -1093,6 +1126,7 @@ def main():
     sample.add_argument("--thumb-width", type=int, default=320)
     sample.add_argument("--out", default="candidate-contact-sheet.jpg")
     sample.add_argument("--overwrite", action="store_true")
+    sample.add_argument("--tmp-dir", help=TMP_DIR_HELP)
     sample.set_defaults(func=command_sample)
 
     band = sub.add_parser("band", help="预览字幕裁切区域")
@@ -1102,6 +1136,7 @@ def main():
     band.add_argument("--band-bottom", type=float, default=0.96)
     band.add_argument("--out", default="band-preview.jpg")
     band.add_argument("--overwrite", action="store_true")
+    band.add_argument("--tmp-dir", help=TMP_DIR_HELP)
     band.set_defaults(func=command_band)
 
     render = sub.add_parser("render", help="按 manifest 渲染整套拼图")
@@ -1135,6 +1170,7 @@ def main():
         help="跳过重复画面检查（默认遇到静态封面或重复字幕条会中止）",
     )
     render.add_argument("--overwrite", action="store_true")
+    render.add_argument("--tmp-dir", help=TMP_DIR_HELP)
     render.add_argument(
         "--keep-going",
         action="store_true",
@@ -1187,6 +1223,7 @@ def main():
         help="跳过重复画面检查（默认遇到静态封面或重复字幕条会中止）",
     )
     scripted.add_argument("--overwrite", action="store_true")
+    scripted.add_argument("--tmp-dir", help=TMP_DIR_HELP)
     scripted.set_defaults(func=command_render_script)
 
     args = parser.parse_args()
@@ -1233,6 +1270,9 @@ def main():
         and not 0.25 <= args.hero_fraction <= 0.85
     ):
         raise SystemExit("--hero-fraction 必须在 0.25–0.85 之间")
+    if hasattr(args, "tmp_dir"):
+        global TMP_DIR
+        TMP_DIR = resolve_tmp_dir(args.tmp_dir)
     args.func(args)
 
 

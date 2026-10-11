@@ -1061,5 +1061,103 @@ class KeepGoingResumeTests(unittest.TestCase):
         self.assertEqual(rendered, ["02_乙.jpg"])
 
 
+class TmpDirTests(unittest.TestCase):
+    def setUp(self):
+        patcher = mock.patch.object(MODULE, "TMP_DIR", None)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        env = mock.patch.dict(os.environ)
+        env.start()
+        self.addCleanup(env.stop)
+        os.environ.pop(MODULE.TMP_DIR_ENV, None)
+
+    def run_grab(self, **kwargs):
+        seen = {}
+
+        def fake_ffmpeg(args, context=""):
+            seen["tmp"] = args[-1]
+            Image.new("RGB", (8, 8), "red").save(args[-1], format="PNG")
+
+        with mock.patch.object(MODULE, "ffmpeg", side_effect=fake_ffmpeg):
+            MODULE.grab_frame("video.mp4", 1.0, **kwargs)
+        return seen["tmp"]
+
+    def test_default_uses_system_temp(self):
+        tmp = self.run_grab()
+        self.assertEqual(
+            Path(tmp).parent.resolve(), Path(tempfile.gettempdir()).resolve()
+        )
+        self.assertFalse(os.path.exists(tmp))
+
+    def test_explicit_dir_is_used_and_cleaned(self):
+        with tempfile.TemporaryDirectory() as folder:
+            tmp = self.run_grab(tmp_dir=folder)
+            self.assertEqual(Path(tmp).parent, Path(folder))
+            self.assertEqual(os.listdir(folder), [])
+
+    def test_module_setting_is_used(self):
+        with tempfile.TemporaryDirectory() as folder:
+            with mock.patch.object(MODULE, "TMP_DIR", folder):
+                tmp = self.run_grab()
+            self.assertEqual(Path(tmp).parent, Path(folder))
+
+    def test_resolve_default_is_none(self):
+        self.assertIsNone(MODULE.resolve_tmp_dir(None))
+
+    def test_resolve_missing_dir(self):
+        with tempfile.TemporaryDirectory() as folder:
+            missing = Path(folder) / "nope"
+            with self.assertRaises(SystemExit) as ctx:
+                MODULE.resolve_tmp_dir(str(missing))
+        self.assertIn("不存在", str(ctx.exception))
+
+    def test_resolve_not_a_directory(self):
+        with tempfile.NamedTemporaryFile() as handle:
+            with self.assertRaises(SystemExit) as ctx:
+                MODULE.resolve_tmp_dir(handle.name)
+        self.assertIn("不是目录", str(ctx.exception))
+
+    def test_resolve_unwritable_dir(self):
+        with tempfile.TemporaryDirectory() as folder:
+            with mock.patch.object(MODULE.os, "access", return_value=False):
+                with self.assertRaises(SystemExit) as ctx:
+                    MODULE.resolve_tmp_dir(folder)
+        self.assertIn("不可写", str(ctx.exception))
+
+    def test_env_used_and_flag_wins(self):
+        with tempfile.TemporaryDirectory() as env_dir, \
+                tempfile.TemporaryDirectory() as flag_dir:
+            os.environ[MODULE.TMP_DIR_ENV] = env_dir
+            self.assertEqual(MODULE.resolve_tmp_dir(None), str(Path(env_dir).resolve()))
+            self.assertEqual(
+                MODULE.resolve_tmp_dir(flag_dir), str(Path(flag_dir).resolve())
+            )
+
+    def test_env_invalid_reports_source(self):
+        os.environ[MODULE.TMP_DIR_ENV] = "/definitely/not/here"
+        with self.assertRaises(SystemExit) as ctx:
+            MODULE.resolve_tmp_dir(None)
+        self.assertIn(MODULE.TMP_DIR_ENV, str(ctx.exception))
+
+    def test_mkstemp_failure_is_clear_error(self):
+        with mock.patch.object(
+            MODULE.tempfile, "mkstemp", side_effect=PermissionError(13, "拒绝访问")
+        ):
+            with self.assertRaises(SystemExit) as ctx:
+                MODULE.grab_frame("video.mp4", 1.0)
+        self.assertIn("--tmp-dir", str(ctx.exception))
+
+    def test_cli_rejects_missing_dir_before_rendering(self):
+        with tempfile.TemporaryDirectory() as folder:
+            proc = subprocess.run(
+                [sys.executable, str(SCRIPT), "band", "x.mp4", "-t", "1",
+                 "--tmp-dir", str(Path(folder) / "nope")],
+                capture_output=True, text=True, encoding="utf-8",
+            )
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("不存在", proc.stderr)
+        self.assertNotIn("Traceback", proc.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()
